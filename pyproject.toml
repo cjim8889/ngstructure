@@ -23,3 +23,16 @@ dependencies = [
 
 [tool.ruff.lint]
 ignore = ["F722", "F821", "E731"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+torchvision = [
+    { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
