@@ -206,6 +206,8 @@ class MolecularDiffusionModel(L.LightningModule):
 
 
 def main():
+    torch.set_float32_matmul_precision("medium")
+    
     parser = argparse.ArgumentParser(description="Train molecular diffusion model")
     parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
     parser.add_argument("--vocab_file", type=str, default="data/vocab.txt", help="Vocabulary file")
