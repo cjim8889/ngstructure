@@ -385,6 +385,8 @@ class MolecularDiffusionTrainer:
                     max_length=self.max_length,
                     guidance_scale=1.0
                 )
+
+                self.evaluator = MolecularEvaluator()
                 print("Generator initialized for evaluation.")
             except Exception as e:
                 print(f"Warning: Could not initialize generator: {e}")
