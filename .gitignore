@@ -209,6 +209,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-data/
+data/*.zip
+data/*.npz
+data/*.csv
 checkpoints/
 logs/
