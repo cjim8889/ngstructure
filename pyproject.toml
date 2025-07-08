@@ -18,6 +18,7 @@ dependencies = [
     "jaxtyping>=0.3.2",
     "jmp>=0.0.4",
     "optax>=0.2.5",
+    "rdkit>=2023.3.3",
 ]
 
 

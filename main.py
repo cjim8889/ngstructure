@@ -13,6 +13,8 @@ from tqdm import tqdm
 
 from pkg.data_module import MolecularDataModule
 from pkg.embedding import Embedding
+from pkg.evaluator import MolecularEvaluator
+from pkg.generator import MolecularGenerator
 from pkg.objective import diffusion_lm_loss
 from pkg.scheduler import DiffusionScheduler
 from pkg.transformer import SequenceDiT
@@ -74,6 +76,9 @@ class MolecularDiffusionTrainer:
         beta_start: float = 1e-4,
         beta_end: float = 4e-2,
         use_mixed_precision: bool = False,
+        eval_generation: bool = True,
+        eval_max_batches: int = 5,
+        eval_temperature: float = 1.0,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         if key is None:
@@ -83,6 +88,11 @@ class MolecularDiffusionTrainer:
         self.embedding_size = embedding_size
         self.max_length = max_length
         self.learning_rate = learning_rate
+        
+        # Evaluation parameters
+        self.eval_generation = eval_generation
+        self.eval_max_batches = eval_max_batches
+        self.eval_temperature = eval_temperature
         
         # Setup mixed precision policy
         if use_mixed_precision:
@@ -119,6 +129,12 @@ class MolecularDiffusionTrainer:
             beta_start=beta_start,
             beta_end=beta_end
         )
+        
+        # Initialize generator for evaluation (will need tokenizer from data module)
+        self.generator = None  # Will be initialized in train() when tokenizer is available
+        
+        # Initialize evaluator
+        self.evaluator = MolecularEvaluator() if eval_generation else None
         
         # Initialize optimizer
         self.optimizer = optax.adamw(
@@ -205,12 +221,105 @@ class MolecularDiffusionTrainer:
         
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
         
+        # Generation evaluation
+        gen_metrics = {}
+        if self.eval_generation and self.generator is not None and self.evaluator is not None:
+            print(f"\nRunning generation evaluation on {self.eval_max_batches} batches...")
+            eval_key = jax.random.fold_in(key, 9999)  # Use a different key for evaluation
+            
+            # Create evaluation batches with ground truth SMILES
+            eval_batches = []
+            for batch_idx, batch in enumerate(data_loader):
+                if batch_idx >= self.eval_max_batches:
+                    break
+                eval_batch = {
+                    'dreams_embedding': batch['dreams_embedding'],
+                    'smiles': batch.get('smiles', [])  # Ground truth SMILES if available
+                }
+                eval_batches.append(eval_batch)
+            
+            # Run generation evaluation
+            if eval_batches:
+                total_generated = 0
+                total_valid = 0
+                total_similarity = 0.0
+                similarity_count = 0
+                all_smiles_pairs = []  # Collect all generated/reference pairs
+                
+                for batch_idx, eval_batch in enumerate(eval_batches):
+                    batch_key = jax.random.fold_in(eval_key, batch_idx)
+                    batch_metrics = self.evaluator.evaluate_batch(
+                        self.generator,
+                        batch_key,
+                        eval_batch,
+                        temperature=self.eval_temperature
+                    )
+                    
+                    total_generated += batch_metrics['num_generated']
+                    total_valid += batch_metrics['num_valid']
+                    if batch_metrics['num_valid'] > 0:
+                        total_similarity += batch_metrics['avg_similarity'] * batch_metrics['num_valid']
+                        similarity_count += batch_metrics['num_valid']
+                    
+                    # Collect SMILES pairs for logging (use already computed metrics)
+                    generated_smiles = batch_metrics.get('generated_smiles', [])
+                    gt_smiles = batch_metrics.get('gt_smiles', [])
+                    
+                    for i, (gen_smiles, ref_smiles) in enumerate(zip(generated_smiles, gt_smiles)):
+                        all_smiles_pairs.append({
+                            'batch_idx': batch_idx,
+                            'sample_idx': i,
+                            'generated_smiles': gen_smiles,
+                            'reference_smiles': ref_smiles or "N/A"
+                        })
+                
+                # Calculate overall metrics
+                gen_metrics = {
+                    'gen_validity_rate': total_valid / total_generated if total_generated > 0 else 0.0,
+                    'gen_avg_similarity': total_similarity / similarity_count if similarity_count > 0 else 0.0,
+                    'gen_num_generated': total_generated,
+                    'gen_num_valid': total_valid
+                }
+                
+                # Log SMILES pairs to wandb
+                if wandb.run is not None and all_smiles_pairs:
+                    # Create a wandb table for SMILES pairs
+                    smiles_table = wandb.Table(
+                        columns=["Batch", "Sample", "Generated SMILES", "Reference SMILES"]
+                    )
+                    
+                    # Add rows to the table (limit to prevent overwhelming logs)
+                    max_rows_to_log = 50  # Limit number of rows for readability
+                    for pair in all_smiles_pairs[:max_rows_to_log]:
+                        smiles_table.add_data(
+                            pair['batch_idx'],
+                            pair['sample_idx'],
+                            pair['generated_smiles'],
+                            pair['reference_smiles']
+                        )
+                    
+                    gen_metrics['smiles_pairs'] = smiles_table
+                
+                print(f"Generation metrics: Validity={gen_metrics['gen_validity_rate']:.3f}, "
+                      f"Similarity={gen_metrics['gen_avg_similarity']:.3f}, "
+                      f"Valid={gen_metrics['gen_num_valid']}/{gen_metrics['gen_num_generated']}")
+                
+                # Print a few examples
+                print(f"\nExample generated/reference pairs:")
+                for i, pair in enumerate(all_smiles_pairs[:5]):  # Show first 5 examples
+                    print(f"  {i+1}. Generated: {pair['generated_smiles'][:50]}{'...' if len(pair['generated_smiles']) > 50 else ''}")
+                    print(f"     Reference: {pair['reference_smiles'][:50]}{'...' if len(pair['reference_smiles']) > 50 else ''}")
+                if len(all_smiles_pairs) > 5:
+                    print(f"  ... and {len(all_smiles_pairs) - 5} more pairs")
+        
         # Log to wandb if available
         if wandb.run is not None:
-            wandb.log({
+            log_dict = {
                 'val_loss': avg_loss,
                 'epoch': epoch
-            })
+            }
+            log_dict.update(gen_metrics)  # Add generation metrics
+            wandb.log(log_dict)
         
         return avg_loss
     
@@ -265,6 +374,22 @@ class MolecularDiffusionTrainer:
         train_loader = data_module.get_train_dataloader()
         val_loader = data_module.get_val_dataloader()
         
+        # Initialize generator for evaluation if enabled
+        if self.eval_generation and self.generator is None and self.evaluator is not None:
+            try:
+                tokenizer = data_module.tokenizer
+                self.generator = MolecularGenerator(
+                    model=self.model,
+                    scheduler=self.scheduler,
+                    tokenizer=tokenizer,
+                    max_length=self.max_length,
+                    guidance_scale=1.0
+                )
+                print("Generator initialized for evaluation.")
+            except Exception as e:
+                print(f"Warning: Could not initialize generator: {e}")
+                self.eval_generation = False
+        
         print(f"Starting training for {max_epochs} epochs...")
         print(f"Training samples: {len(data_module.train_dataset)}")
         print(f"Validation samples: {len(data_module.val_dataset)}")
@@ -300,7 +425,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
     parser.add_argument("--vocab_file", type=str, default="data/vocab.txt", help="Vocabulary file")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("--max_length", type=int, default=500, help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of data loader workers")
     
     # Model parameters
@@ -321,6 +446,11 @@ def main():
     parser.add_argument("--use_mixed_precision", action="store_true", help="Use mixed precision training")
     parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    
+    # Generation evaluation parameters
+    parser.add_argument("--eval_generation", action="store_true", help="Enable generation evaluation during validation")
+    parser.add_argument("--eval_max_batches", type=int, default=2, help="Maximum batches for generation evaluation")
+    parser.add_argument("--eval_temperature", type=float, default=1.0, help="Temperature for generation sampling")
     
     # Wandb logging
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases logging")
@@ -380,6 +510,9 @@ def main():
         beta_start=args.beta_start,
         beta_end=args.beta_end,
         use_mixed_precision=args.use_mixed_precision,
+        eval_generation=args.eval_generation,
+        eval_max_batches=args.eval_max_batches,
+        eval_temperature=args.eval_temperature,
         key=key
     )
     
