@@ -16,12 +16,14 @@ class MolecularDataset(Dataset):
     
     def __init__(self, meta_file: str, arrays_file: str, vocab_file: str, max_length: int = 500):
         self.meta_df = pd.read_csv(meta_file)
-        self.arrays_data = np.load(arrays_file)
+        # self.arrays_data = np.load(arrays_file)
         self.tokenizer = SmilesTokenizer(vocab_file=vocab_file)
         self.max_length = max_length
         
         # Extract dreams_embedding from NPZ file
-        self.dreams_embeddings = self.arrays_data['dreams_embedding']
+
+        with np.load(arrays_file) as arrays_data:
+            self.dreams_embeddings = arrays_data['dreams_embedding'].copy()
         
         # Encode categorical variables for conditioning
         self.instrument_encoder = LabelEncoder()
@@ -85,7 +87,7 @@ class MolecularDataModule(L.LightningDataModule):
         vocab_file: str = "data/vocab.txt",
         batch_size: int = 32,
         max_length: int = 64,
-        num_workers: int = 4
+        num_workers: int = 0
     ):
         super().__init__()
         self.data_dir = data_dir
