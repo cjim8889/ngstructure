@@ -6,7 +6,6 @@ from typing import Optional
 
 import equinox as eqx
 import jax
-jax.config.update("jax_debug_nans", True)
 import jmp
 import optax
 import wandb
@@ -17,6 +16,45 @@ from pkg.embedding import Embedding
 from pkg.objective import diffusion_lm_loss
 from pkg.scheduler import DiffusionScheduler
 from pkg.transformer import SequenceDiT
+
+
+def loss_fn(model, batch, key, scheduler):
+    """Compute loss for a batch using the diffusion objective."""
+    tokens = batch['tokens']
+    dreams_emb = batch['dreams_embedding']
+    
+    losses = diffusion_lm_loss(
+        key=key,
+        denoiser=model,
+        tokens=tokens,
+        max_t=scheduler.num_timesteps - 1,
+        cond_emb=dreams_emb,
+        sched=scheduler
+    )
+    
+    return losses
+
+@eqx.filter_jit
+@eqx.debug.assert_max_traces(max_traces=2)
+def train_step(model, opt_state, batch, key, optimizer, scheduler):
+    """Single training step with gradient computation."""
+    
+    def loss_and_grads(model):
+        loss = loss_fn(model, batch, key, scheduler)
+        return loss
+    
+    # Compute gradients
+    loss, grads = eqx.filter_value_and_grad(loss_and_grads)(model)
+    
+    # Apply optimizer update
+    updates, new_opt_state = optimizer.update(
+        grads,
+        opt_state,
+        eqx.filter(model, eqx.is_array),
+    )
+    new_model = eqx.apply_updates(model, updates)
+    
+    return new_model, new_opt_state, loss
 
 
 class MolecularDiffusionTrainer:
@@ -91,46 +129,13 @@ class MolecularDiffusionTrainer:
         )
         
         # Initialize optimizer state
-        params = eqx.filter(self.model, eqx.is_inexact_array)
+        params = eqx.filter(self.model, eqx.is_array)
         self.opt_state = self.optimizer.init(params)
         
         # Training state
         self.step = 0
         self.epoch = 0
         
-    def loss_fn(self, model, batch, key):
-        """Compute loss for a batch using the diffusion objective."""
-        tokens = batch['tokens']
-        dreams_emb = batch['dreams_embedding']
-        
-        losses = diffusion_lm_loss(
-            key=key,
-            denoiser=model,
-            tokens=tokens,
-            max_t=self.scheduler.num_timesteps - 1,
-            cond_emb=dreams_emb,
-            sched=self.scheduler
-        )
-        
-        return losses
-    
-    @eqx.filter_jit
-    def train_step(self, model, opt_state, batch, key):
-        """Single training step with gradient computation."""
-        
-        def loss_and_grads(model):
-            loss = self.loss_fn(model, batch, key)
-            return loss
-        
-        # Compute gradients
-        loss, grads = eqx.filter_value_and_grad(loss_and_grads)(model)
-        
-        # Apply optimizer update
-        updates, new_opt_state = self.optimizer.update(grads, opt_state, model)
-        new_model = eqx.apply_updates(model, updates)
-        
-        return new_model, new_opt_state, loss
-    
     def train_epoch(self, data_loader, epoch, key):
         """Train for one epoch."""
         epoch_loss = 0.0
@@ -142,9 +147,15 @@ class MolecularDiffusionTrainer:
             # Generate random key for this batch
             step_key = jax.random.fold_in(key, self.step)
             
+            # Keep only JAX array entries that are consumed inside the JIT to avoid retracing
+            train_batch = {
+                'tokens': batch['tokens'],
+                'dreams_embedding': batch['dreams_embedding'],
+            }
+
             # Perform training step
-            self.model, self.opt_state, loss = self.train_step(
-                self.model, self.opt_state, batch, step_key
+            self.model, self.opt_state, loss = train_step(
+                self.model, self.opt_state, train_batch, step_key, self.optimizer, self.scheduler
             )
             
             # Update metrics
@@ -176,8 +187,14 @@ class MolecularDiffusionTrainer:
             # Generate random key for this batch
             step_key = jax.random.fold_in(key, batch_idx)
             
+            # Only keep relevant array fields to avoid retracing inside JITed loss_fn
+            val_batch = {
+                'tokens': batch['tokens'],
+                'dreams_embedding': batch['dreams_embedding'],
+            }
+
             # Compute validation loss
-            loss = self.loss_fn(self.model, self.embedding, batch, step_key)
+            loss = loss_fn(self.model, val_batch, step_key, self.scheduler)
             
             # Update metrics
             epoch_loss += float(loss)

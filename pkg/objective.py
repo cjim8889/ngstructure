@@ -9,6 +9,7 @@ from pkg.transformer import SequenceDiT
 
 
 @eqx.filter_jit
+# @eqx.debug.assert_max_traces(max_traces=2)
 def diffusion_lm_loss(
     key:              jax.random.PRNGKey,
     denoiser:         SequenceDiT,                           # f_θ
@@ -48,7 +49,7 @@ def diffusion_lm_loss(
 
     # ---- embedding-match  +  NLL  at t = 1 ---------------------------------
     x1        = sched.add_noise(rng_1, x0, 1)
-    x0_pred_1 = jax.vmap(denoiser, in_axes=(0,0,0))(x1, jnp.ones(shape=(x1.shape[0],)) / max_t, cond_emb)
+    x0_pred_1 = jax.vmap(denoiser, in_axes=(0, 0, 0))(x1, jnp.ones(shape=(x1.shape[0],)) / max_t, cond_emb)
 
     embed_err  = jnp.mean(jnp.sum((emb_clean - x0_pred_1) ** 2, axis=(-1, -2)))
 

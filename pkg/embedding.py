@@ -9,7 +9,7 @@ from jaxtyping import Float, Int, Array
 class Embedding(eqx.Module):
     # Parameters
     embedding: eqx.nn.Embedding               # [vocab, d]
-    bias: jnp.ndarray                         # [vocab]
+    bias: Array                       # [vocab]
     # Static field
     embedding_size: int = eqx.field(static=True)
 
@@ -30,7 +30,7 @@ class Embedding(eqx.Module):
             key=key_emb,
         )
         # Bias for the soft-max classifier (optional but useful)
-        self.bias = jnp.full((vocab_size,), bias_init)
+        self.bias = jnp.full((vocab_size,), bias_init, dtype=jnp.float32)
 
     # ------------- forward:   tokens -> x0  -----------------------------------
     def forward(
