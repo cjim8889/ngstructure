@@ -13,5 +13,13 @@ dependencies = [
     "numpy>=1.24.0",
     "tensorboard>=2.14.0",
     "scikit-learn>=1.3.0",
-    "wandb>=0.21.0",
+    "wandb",
+    "jax>=0.6.2",
+    "equinox>=0.13.0",
+    "jaxtyping>=0.3.2",
+    "jmp>=0.0.4",
 ]
+
+
+[tool.ruff.lint]
+ignore = ["F722", "F821", "E731"]
