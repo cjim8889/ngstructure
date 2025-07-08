@@ -21,7 +21,7 @@ def diffusion_lm_loss(
     """Implements  L_e2e^{x0-simple}  (Li et al. 2022, Eq. 19 / App.F)"""
 
     # ---- PRNG bookkeeping --------------------------------------------------
-    rng_noise, rng_T, rng_t, rng_1 = jax.random.split(key, 4)
+    rng_noise, rng_T, rng_t, rng_noise, rng_1 = jax.random.split(key, 5)
 
     batch_size = tokens.shape[0]
 
@@ -38,13 +38,13 @@ def diffusion_lm_loss(
 
     # ---- reconstruction term  (random t ≥ 2) -------------------------------
     timesteps = jax.random.randint(rng_t, (x0.shape[0],), 2, max_t)
-    noise_keys = jax.random.split(rng_t, x0.shape[0])
+    noise_keys = jax.random.split(rng_noise, x0.shape[0])
     x_t = jax.vmap(sched.add_noise)(noise_keys, x0, timesteps)
 
     x0_pred = jax.vmap(denoiser, in_axes=(0, 0, 0))(x_t,
                                  timesteps.astype(jnp.float32) / max_t,
                                  cond_emb)
-    recon = (1. / (max_t - 2)) * jnp.mean(jnp.sum((x0 - x0_pred) ** 2,
+    recon = (max_t - 1) * jnp.mean(jnp.sum((x0 - x0_pred) ** 2,
                                            axis=(-1, -2)))   # unbiased MC
 
     # ---- embedding-match  +  NLL  at t = 1 ---------------------------------
