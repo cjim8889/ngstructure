@@ -5,7 +5,7 @@ from typing import Any, Dict
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 from pkg.data_module import MolecularDataModule
 from pkg.transformer import DiT
@@ -237,6 +237,13 @@ def main():
     parser.add_argument("--eval_every_n_epochs", type=int, default=1, help="Evaluate every N epochs")
     parser.add_argument("--num_eval_samples", type=int, default=8, help="Number of samples to generate for evaluation")
     
+    # Logging parameters
+    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="molecular-diffusion", help="Wandb project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity/team name")
+    parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="Wandb tags for the run")
+    
     args = parser.parse_args()
     
     # Create directories
@@ -287,11 +294,23 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     
     # Setup logger
-    logger = TensorBoardLogger(
-        save_dir=args.log_dir,
-        name="molecular_diffusion",
-        version=None
-    )
+    if args.use_wandb:
+        logger = WandbLogger(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            tags=args.wandb_tags,
+            save_dir=args.log_dir,
+            log_model=True,  # Log model checkpoints to wandb
+        )
+        print(f"Using Weights & Biases logging - Project: {args.wandb_project}")
+    else:
+        logger = TensorBoardLogger(
+            save_dir=args.log_dir,
+            name="molecular_diffusion",
+            version=None
+        )
+        print(f"Using TensorBoard logging - Log dir: {args.log_dir}")
     
     # Initialize trainer
     trainer = L.Trainer(
