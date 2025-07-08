@@ -1,14 +1,34 @@
 import os
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import torch
 import numpy as np
 import pandas as pd
-import lightning as L
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import LabelEncoder
 
 from deepchem.feat.smiles_tokenizer import SmilesTokenizer
+
+
+def numpy_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Custom collate function that converts PyTorch tensors to numpy arrays for JAX compatibility."""
+    if not batch:
+        return {}
+    
+    # Get all keys from the first sample
+    keys = batch[0].keys()
+    collated = {}
+    
+    for key in keys:
+        if key == 'smiles':
+            # Keep SMILES as list of strings
+            collated[key] = [sample[key] for sample in batch]
+        else:
+            # Stack tensors and convert to numpy
+            stacked = torch.stack([sample[key] for sample in batch])
+            collated[key] = stacked.numpy()
+    
+    return collated
 
 
 class MolecularDataset(Dataset):
@@ -78,8 +98,8 @@ class MolecularDataset(Dataset):
         }
 
 
-class MolecularDataModule(L.LightningDataModule):
-    """Lightning data module for molecular data with SMILES and dreams embeddings."""
+class MolecularDataModule:
+    """Data module for molecular data with SMILES and dreams embeddings."""
     
     def __init__(
         self,
@@ -89,7 +109,6 @@ class MolecularDataModule(L.LightningDataModule):
         max_length: int = 64,
         num_workers: int = 0
     ):
-        super().__init__()
         self.data_dir = data_dir
         self.vocab_file = vocab_file
         self.batch_size = batch_size
@@ -99,8 +118,12 @@ class MolecularDataModule(L.LightningDataModule):
         # Store dataset info for model initialization
         self.num_instruments = None
         self.num_adducts = None
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
         
     def setup(self, stage: Optional[str] = None):
+        """Setup datasets for training, validation, and testing."""
         if stage == "fit" or stage is None:
             self.train_dataset = MolecularDataset(
                 meta_file=os.path.join(self.data_dir, "train_meta.csv"),
@@ -127,34 +150,43 @@ class MolecularDataModule(L.LightningDataModule):
                 max_length=self.max_length
             )
     
-    def train_dataloader(self):
+    def get_train_dataloader(self):
+        """Get training dataloader."""
+        if self.train_dataset is None:
+            self.setup("fit")
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True if self.num_workers > 0 else False
+            collate_fn=numpy_collate_fn,
         )
     
-    def val_dataloader(self):
+    def get_val_dataloader(self):
+        """Get validation dataloader."""
+        if self.val_dataset is None:
+            self.setup("fit")
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True if self.num_workers > 0 else False
+            collate_fn=numpy_collate_fn,
         )
     
-    def test_dataloader(self):
+    def get_test_dataloader(self):
+        """Get test dataloader."""
+        if self.test_dataset is None:
+            self.setup("test")
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True if self.num_workers > 0 else False
+            collate_fn=numpy_collate_fn,
         )
     
     def get_dataset_info(self):
@@ -171,6 +203,23 @@ class MolecularDataModule(L.LightningDataModule):
         } 
     
 if __name__ == "__main__":
-    data_module = MolecularDataModule()
+    data_module = MolecularDataModule(batch_size=2)  # Small batch for testing
     data_module.setup("fit")
-    print(data_module.train_dataset[0])
+    
+    # Test single sample (PyTorch tensors)
+    print("Single sample (PyTorch tensors):")
+    sample = data_module.train_dataset[0]
+    for key, value in sample.items():
+        if key == 'smiles':
+            print(f"  {key}: {value}")
+        else:
+            print(f"  {key}: {type(value)} shape {value.shape}")
+    
+    print("\nBatch from dataloader (numpy arrays):")
+    train_loader = data_module.get_train_dataloader()
+    batch = next(iter(train_loader))
+    for key, value in batch.items():
+        if key == 'smiles':
+            print(f"  {key}: {type(value)} length {len(value)}")
+        else:
+            print(f"  {key}: {type(value)} shape {value.shape} dtype {value.dtype}")
