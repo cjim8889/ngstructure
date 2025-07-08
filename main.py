@@ -1,75 +1,78 @@
 import argparse
 import os
-from typing import Any, Dict
+import pickle
+import time
+from typing import Optional
 
-import lightning as L
-import torch
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+import equinox as eqx
+import jax
+jax.config.update("jax_debug_nans", True)
+import jmp
+import optax
+import wandb
+from tqdm import tqdm
 
 from pkg.data_module import MolecularDataModule
-from pkg.transformer import DiT
-from pkg.generator import MolecularGenerator, EpochEvaluator
+from pkg.embedding import Embedding
+from pkg.objective import diffusion_lm_loss
+from pkg.scheduler import DiffusionScheduler
+from pkg.transformer import SequenceDiT
 
 
-class DiffusionScheduler:
-    """Simple linear noise scheduler for diffusion training."""
-    
-    def __init__(self, num_timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
-        self.num_timesteps = num_timesteps
-        
-        # Linear noise schedule
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-    
-    def add_noise(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        """Add noise to clean data according to diffusion forward process."""
-        # Ensure scheduler tensors are on the same device as input tensors
-        device = x_0.device
-        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
-        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
-        
-        sqrt_alpha_cumprod_t = sqrt_alphas_cumprod[t].view(-1, 1, 1)
-        sqrt_one_minus_alpha_cumprod_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
-        
-        return sqrt_alpha_cumprod_t * x_0 + sqrt_one_minus_alpha_cumprod_t * noise
-
-
-class MolecularDiffusionModel(L.LightningModule):
-    """Lightning module for molecular diffusion model training."""
+class MolecularDiffusionTrainer:
+    """JAX-based trainer for molecular diffusion models."""
     
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = 384,
+        embedding_size: int = 384,
         num_layers: int = 12,
-        nhead: int = 6,
-        mlp_ratio: float = 4.0,
-        dreams_emb_dim: int = 1024,
+        num_heads: int = 6,
+        hidden_size: int = 1536,  # mlp_ratio * embedding_size
+        dreams_emb_size: int = 1024,
         max_length: int = 500,
         learning_rate: float = 1e-4,
         num_timesteps: int = 1000,
         beta_start: float = 1e-4,
-        beta_end: float = 2e-2,
-        vocab_file: str = "data/vocab.txt",
-        eval_every_n_epochs: int = 5,
-        num_eval_samples: int = 8,
+        beta_end: float = 4e-2,
+        use_mixed_precision: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
     ):
-        super().__init__()
-        self.save_hyperparameters()
+        if key is None:
+            key = jax.random.PRNGKey(42)
         
-        # Initialize DiT model
-        self.model = DiT(
+        self.vocab_size = vocab_size
+        self.embedding_size = embedding_size
+        self.max_length = max_length
+        self.learning_rate = learning_rate
+        
+        # Setup mixed precision policy
+        if use_mixed_precision:
+            self.mp_policy = jmp.get_policy('half')
+        else:
+            self.mp_policy = jmp.get_policy('full')
+        
+        # Initialize model components
+        key_emb, key_model, key_sched = jax.random.split(key, 3)
+        
+        # Initialize embedding layer
+        self.embedding = Embedding(
             vocab_size=vocab_size,
-            d_model=d_model,
-            num_layers=num_layers,
-            nhead=nhead,
-            mlp_ratio=mlp_ratio,
-            dreams_emb_dim=dreams_emb_dim,
+            embedding_size=embedding_size,
+            key=key_emb
+        )
+        
+        # Initialize transformer model  
+        self.model = SequenceDiT(
             max_length=max_length,
+            vocab_size=vocab_size,
+            embedding_size=embedding_size,
+            dreams_embedding_size=dreams_emb_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            key=key_model,
+            mp_policy=self.mp_policy
         )
         
         # Initialize diffusion scheduler
@@ -79,136 +82,204 @@ class MolecularDiffusionModel(L.LightningModule):
             beta_end=beta_end
         )
         
-        self.learning_rate = learning_rate
-        self.vocab_file = vocab_file
-        self.eval_every_n_epochs = eval_every_n_epochs
-        self.num_eval_samples = num_eval_samples
-        
-        # Initialize generator and evaluator (will be setup in on_train_start)
-        self.generator = None
-        self.evaluator = None
-        
-        # Move scheduler tensors to device when model is moved
-        self.register_buffer('_dummy', torch.tensor(0.0))
-    
-    def training_step(self, batch, batch_idx):
-        return self._shared_step(batch, "train")
-    
-    def validation_step(self, batch, batch_idx):
-        return self._shared_step(batch, "val")
-    
-    def test_step(self, batch, batch_idx):
-        return self._shared_step(batch, "test")
-    
-    def _shared_step(self, batch, stage):
-        dreams_embedding = batch['dreams_embedding']  # Clean dreams embedding data
-        x_0 = batch['tokens']
-        x_0_emb = self.model.embed_x(x_0)
-        
-        batch_size = x_0_emb.shape[0]
-        
-        # Sample random timesteps
-        t = torch.randint(0, self.scheduler.num_timesteps, (batch_size,), device=x_0_emb.device)
-        
-        # Sample noise
-        noise = torch.randn_like(x_0_emb)
-        
-        # Add noise to clean data
-        x_t = self.scheduler.add_noise(x_0_emb, t, noise)
-        # Predict the noise
-        predicted_score = self.model(
-            x_t, 
-            t.unsqueeze(1), 
-            dreams_embedding,
-        )
-
-        # Ensure scheduler tensor is on correct device
-        sqrt_alphas_cumprod = self.scheduler.sqrt_alphas_cumprod.to(x_0_emb.device)
-        loss = predicted_score + (x_t - x_0_emb) / sqrt_alphas_cumprod[t].reshape(-1, 1, 1)
-        loss = torch.mean(loss ** 2)
-        
-        # Logging
-        self.log(f'{stage}_loss', loss, on_step=(stage=='train'), on_epoch=True, prog_bar=True)
-        
-        return loss
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
+        # Initialize optimizer
+        self.optimizer = optax.adamw(
+            learning_rate=learning_rate,
             weight_decay=1e-4,
-            betas=(0.9, 0.95)
+            b1=0.9,
+            b2=0.95
         )
         
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs,
-            eta_min=self.learning_rate * 0.1
+        # Initialize optimizer state
+        params = eqx.filter(self.model, eqx.is_inexact_array)
+        self.opt_state = self.optimizer.init(params)
+        
+        # Training state
+        self.step = 0
+        self.epoch = 0
+        
+    def loss_fn(self, model, batch, key):
+        """Compute loss for a batch using the diffusion objective."""
+        tokens = batch['tokens']
+        dreams_emb = batch['dreams_embedding']
+        
+        losses = diffusion_lm_loss(
+            key=key,
+            denoiser=model,
+            tokens=tokens,
+            max_t=self.scheduler.num_timesteps - 1,
+            cond_emb=dreams_emb,
+            sched=self.scheduler
         )
         
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-            },
+        return losses
+    
+    @eqx.filter_jit
+    def train_step(self, model, opt_state, batch, key):
+        """Single training step with gradient computation."""
+        
+        def loss_and_grads(model):
+            loss = self.loss_fn(model, batch, key)
+            return loss
+        
+        # Compute gradients
+        loss, grads = eqx.filter_value_and_grad(loss_and_grads)(model)
+        
+        # Apply optimizer update
+        updates, new_opt_state = self.optimizer.update(grads, opt_state, model)
+        new_model = eqx.apply_updates(model, updates)
+        
+        return new_model, new_opt_state, loss
+    
+    def train_epoch(self, data_loader, epoch, key):
+        """Train for one epoch."""
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        pbar = tqdm(data_loader, desc=f"Epoch {epoch}")
+        
+        for batch_idx, batch in enumerate(pbar):
+            # Generate random key for this batch
+            step_key = jax.random.fold_in(key, self.step)
+            
+            # Perform training step
+            self.model, self.opt_state, loss = self.train_step(
+                self.model, self.opt_state, batch, step_key
+            )
+            
+            # Update metrics
+            epoch_loss += float(loss)
+            num_batches += 1
+            self.step += 1
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{loss:.4f}', 'avg_loss': f'{epoch_loss/num_batches:.4f}'})
+            
+            # Log to wandb if available
+            if wandb.run is not None:
+                wandb.log({
+                    'train_loss': float(loss),
+                    'step': self.step,
+                    'epoch': epoch
+                })
+        
+        return epoch_loss / num_batches if num_batches > 0 else 0.0
+    
+    def validate_epoch(self, data_loader, epoch, key):
+        """Validate for one epoch."""
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        pbar = tqdm(data_loader, desc=f"Validation {epoch}")
+        
+        for batch_idx, batch in enumerate(pbar):
+            # Generate random key for this batch
+            step_key = jax.random.fold_in(key, batch_idx)
+            
+            # Compute validation loss
+            loss = self.loss_fn(self.model, self.embedding, batch, step_key)
+            
+            # Update metrics
+            epoch_loss += float(loss)
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({'val_loss': f'{loss:.4f}', 'avg_val_loss': f'{epoch_loss/num_batches:.4f}'})
+        
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+        
+        # Log to wandb if available
+        if wandb.run is not None:
+            wandb.log({
+                'val_loss': avg_loss,
+                'epoch': epoch
+            })
+        
+        return avg_loss
+    
+    def save_checkpoint(self, checkpoint_dir: str, epoch: int, val_loss: float):
+        """Save model checkpoint."""
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch:03d}_val_{val_loss:.4f}.pkl')
+        
+        checkpoint = {
+            'model': self.model,
+            'embedding': self.embedding,
+            'opt_state': self.opt_state,
+            'scheduler': self.scheduler,
+            'epoch': epoch,
+            'step': self.step,
+            'val_loss': val_loss,
         }
+        
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        
+        print(f"Saved checkpoint: {checkpoint_path}")
+        return checkpoint_path
     
-    def on_train_start(self) -> None:
-        """Setup generator and evaluator when training starts."""
-        # Import here to avoid circular imports
-        from deepchem.feat.smiles_tokenizer import SmilesTokenizer
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint."""
+        with open(checkpoint_path, 'rb') as f:
+            checkpoint = pickle.load(f)
         
-        # Initialize tokenizer
-        tokenizer = SmilesTokenizer(vocab_file=self.vocab_file)
+        self.model = checkpoint['model']
+        self.embedding = checkpoint['embedding'] 
+        self.opt_state = checkpoint['opt_state']
+        self.scheduler = checkpoint['scheduler']
+        self.epoch = checkpoint['epoch']
+        self.step = checkpoint['step']
         
-        # Initialize generator
-        self.generator = MolecularGenerator(
-            model=self.model,
-            scheduler=self.scheduler,
-            tokenizer=tokenizer,
-            max_length=self.model.max_length
-        )
-        
-        # Initialize evaluator
-        self.evaluator = EpochEvaluator(
-            generator=self.generator,
-            num_samples=self.num_eval_samples,
-            log_interval=self.eval_every_n_epochs
-        )
+        print(f"Loaded checkpoint: {checkpoint_path}")
     
-    def on_train_epoch_end(self) -> None:
-        """Run evaluation after each training epoch."""
-        if self.evaluator is not None and hasattr(self.trainer, 'current_epoch'):
-            try:
-                metrics = self.evaluator.evaluate(self, self.trainer.current_epoch)
+    def train(
+        self,
+        data_module: MolecularDataModule,
+        max_epochs: int,
+        checkpoint_dir: str,
+        save_every: int = 5,
+        key: Optional[jax.random.PRNGKey] = None
+    ):
+        """Main training loop."""
+        if key is None:
+            key = jax.random.PRNGKey(int(time.time()))
+        
+        # Setup data
+        data_module.setup("fit")
+        train_loader = data_module.get_train_dataloader()
+        val_loader = data_module.get_val_dataloader()
+        
+        print(f"Starting training for {max_epochs} epochs...")
+        print(f"Training samples: {len(data_module.train_dataset)}")
+        print(f"Validation samples: {len(data_module.val_dataset)}")
+        
+        best_val_loss = float('inf')
+        
+        for epoch in range(self.epoch, max_epochs):
+            epoch_key = jax.random.fold_in(key, epoch)
+            train_key, val_key = jax.random.split(epoch_key)
+            
+            # Training phase
+            print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
+            train_loss = self.train_epoch(train_loader, epoch + 1, train_key)
+            
+            # Validation phase
+            val_loss = self.validate_epoch(val_loader, epoch + 1, val_key)
+            
+            self.epoch = epoch + 1
+            
+            print(f"Epoch {self.epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+            
+            # Save checkpoint if validation improved or every save_every epochs
+            if val_loss < best_val_loss or (epoch + 1) % save_every == 0:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    print(f"New best validation loss: {val_loss:.4f}")
                 
-                # Print some example generated SMILES
-                if metrics and self.trainer.current_epoch % self.eval_every_n_epochs == 0:
-                    if self.evaluator.evaluation_history:
-                        latest_eval = self.evaluator.evaluation_history[-1]
-                        examples = latest_eval['examples']
-                        
-                        print(f"\n=== Epoch {self.trainer.current_epoch} Generation Examples ===")
-                        for i, (gen, ref) in enumerate(zip(examples['generated_smiles'], examples['reference_smiles'])):
-                            print(f"Generated {i+1}: {gen}")
-                            print(f"Reference {i+1}: {ref}")
-                            print()
-            except Exception as e:
-                print(f"Evaluation failed: {e}")
-    
-    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        # Ensure scheduler tensors are on the correct device
-        device = self._dummy.device
-        for key, value in self.scheduler.__dict__.items():
-            if isinstance(value, torch.Tensor):
-                setattr(self.scheduler, key, value.to(device))
+                self.save_checkpoint(checkpoint_dir, self.epoch, val_loss)
 
 
 def main():
-    torch.set_float32_matmul_precision("medium")
-    
-    parser = argparse.ArgumentParser(description="Train molecular diffusion model")
+    parser = argparse.ArgumentParser(description="Train molecular diffusion model with JAX")
     parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
     parser.add_argument("--vocab_file", type=str, default="data/vocab.txt", help="Vocabulary file")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
@@ -216,9 +287,9 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="Number of data loader workers")
     
     # Model parameters
-    parser.add_argument("--d_model", type=int, default=384, help="Model dimension")
+    parser.add_argument("--embedding_size", type=int, default=384, help="Model embedding dimension")
     parser.add_argument("--num_layers", type=int, default=4, help="Number of transformer layers")
-    parser.add_argument("--nhead", type=int, default=6, help="Number of attention heads")
+    parser.add_argument("--num_heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--mlp_ratio", type=float, default=4.0, help="MLP expansion ratio")
     
     # Training parameters
@@ -229,28 +300,39 @@ def main():
     parser.add_argument("--beta_end", type=float, default=4e-2, help="Diffusion beta end")
     
     # Training setup
-    parser.add_argument("--accelerator", type=str, default="auto", help="Accelerator type")
-    parser.add_argument("--devices", type=int, default=1, help="Number of devices")
-    parser.add_argument("--precision", type=str, default="32", help="Training precision")
-    parser.add_argument("--log_dir", type=str, default="logs", help="Logging directory")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint directory")
+    parser.add_argument("--use_mixed_precision", action="store_true", help="Use mixed precision training")
+    parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
-    # Evaluation parameters
-    parser.add_argument("--eval_every_n_epochs", type=int, default=1, help="Evaluate every N epochs")
-    parser.add_argument("--num_eval_samples", type=int, default=8, help="Number of samples to generate for evaluation")
-    
-    # Logging parameters
+    # Wandb logging
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="molecular-diffusion", help="Wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="molecular-diffusion-jax", help="Wandb project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity/team name")
     parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
     parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="Wandb tags for the run")
     
+    # Resume training
+    parser.add_argument("--resume_from", type=str, default=None, help="Resume training from checkpoint")
+    
     args = parser.parse_args()
     
+    # Set random seed
+    key = jax.random.PRNGKey(args.seed)
+    
     # Create directories
-    os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # Initialize wandb if requested
+    if args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            tags=args.wandb_tags,
+            config=vars(args)
+        )
+        print(f"Using Weights & Biases logging - Project: {args.wandb_project}")
     
     # Initialize data module
     data_module = MolecularDataModule(
@@ -264,92 +346,61 @@ def main():
     # Get dataset info for model initialization
     dataset_info = data_module.get_dataset_info()
     
-    # Initialize model with correct dimensions
-    model = MolecularDiffusionModel(
+    # Calculate hidden size from mlp_ratio
+    hidden_size = int(args.embedding_size * args.mlp_ratio)
+    
+    # Initialize trainer
+    trainer = MolecularDiffusionTrainer(
         vocab_size=dataset_info['vocab_size'],
-        d_model=args.d_model,
+        embedding_size=args.embedding_size,
         num_layers=args.num_layers,
-        nhead=args.nhead,
-        mlp_ratio=args.mlp_ratio,
-        dreams_emb_dim=dataset_info['dreams_emb_dim'],
+        num_heads=args.num_heads,
+        hidden_size=hidden_size,
+        dreams_emb_size=dataset_info['dreams_emb_dim'],
         max_length=args.max_length,
         learning_rate=args.learning_rate,
         num_timesteps=args.num_timesteps,
         beta_start=args.beta_start,
         beta_end=args.beta_end,
-        vocab_file=args.vocab_file,
-        eval_every_n_epochs=args.eval_every_n_epochs,
-        num_eval_samples=args.num_eval_samples
+        use_mixed_precision=args.use_mixed_precision,
+        key=key
     )
     
-    # Setup callbacks
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=args.checkpoint_dir,
-        filename='diffusion-{epoch:02d}-{val_loss:.2f}',
-        monitor='val_loss',
-        mode='min',
-        save_top_k=3,
-        save_last=True,
-        every_n_epochs=1
-    )
+    # Resume from checkpoint if specified
+    if args.resume_from:
+        trainer.load_checkpoint(args.resume_from)
     
-    lr_monitor = LearningRateMonitor(logging_interval='epoch')
-    
-    # Setup logger
-    if args.use_wandb:
-        logger = WandbLogger(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_name,
-            tags=args.wandb_tags,
-            save_dir=args.log_dir,
-            log_model=True,  # Log model checkpoints to wandb
-        )
-        print(f"Using Weights & Biases logging - Project: {args.wandb_project}")
-    else:
-        logger = TensorBoardLogger(
-            save_dir=args.log_dir,
-            name="molecular_diffusion",
-            version=None
-        )
-        print(f"Using TensorBoard logging - Log dir: {args.log_dir}")
-    
-    # Initialize trainer
-    trainer = L.Trainer(
-        max_epochs=args.max_epochs,
-        accelerator=args.accelerator,
-        devices=args.devices,
-        precision=args.precision,
-        callbacks=[checkpoint_callback, lr_monitor],
-        logger=logger,
-        gradient_clip_val=1.0,
-        log_every_n_steps=50,
-        check_val_every_n_epoch=1,
-        enable_progress_bar=True,
-        enable_model_summary=True
-    )
-    
-    # Print dataset and model summary
+    # Print model info
     print(f"\nDataset Summary:")
     print(f"Dreams embedding dimension: {dataset_info['dreams_emb_dim']}")
     print(f"Vocabulary size: {dataset_info['vocab_size']}")
     print(f"Number of instruments: {dataset_info['num_instruments']}")
     print(f"Number of adducts: {dataset_info['num_adducts']}")
     
+    # Count model parameters
+    model_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(trainer.model, eqx.is_array)))
+    embedding_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(trainer.embedding, eqx.is_array)))
+    total_params = model_params + embedding_params
+    
     print(f"\nModel Summary:")
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"Model parameters: {model_params:,}")
+    print(f"Embedding parameters: {embedding_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Mixed precision: {args.use_mixed_precision}")
     
     # Start training
-    print(f"\nStarting training...")
-    trainer.fit(model, data_module)
-    
-    # Test the model
-    print(f"\nTesting model...")
-    trainer.test(model, data_module)
+    trainer.train(
+        data_module=data_module,
+        max_epochs=args.max_epochs,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every=args.save_every,
+        key=key
+    )
     
     print(f"\nTraining completed! Checkpoints saved to: {args.checkpoint_dir}")
-    print(f"Logs saved to: {args.log_dir}")
+    
+    if args.use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

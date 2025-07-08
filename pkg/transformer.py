@@ -6,13 +6,14 @@ import jax.numpy as jnp
 import jmp
 from jaxtyping import Array, Float
 
+from pkg.embedding import Embedding
+
 from .utils import init_linear_weights, xavier_init, zero_init
 
 
 # Helper modulation function (same as DiT's modulate)
 def modulate(x: Float[Array, " ... "], shift: Float[Array, " ... "], scale: Float[Array, " ... "]) -> Float[Array, " ... "]:
     return x * (1 + scale) + shift
-
 
 class TimeConditionalEmbedding(eqx.Module):
     net: eqx.nn.MLP
@@ -273,6 +274,7 @@ class SequenceDiT(eqx.Module):
     time_conditional_embedder: TimeConditionalEmbedding
     layers: List[DiTBlock]
     predictor: FinalLayer
+    embedding: Embedding
     mp_policy: jmp.Policy = eqx.field(static=True)
     embedding_size: int = eqx.field(static=True)
     dreams_embedding_size: int = eqx.field(static=True)
@@ -280,6 +282,7 @@ class SequenceDiT(eqx.Module):
     def __init__(
         self,
         max_length: int,
+        vocab_size: int,
         embedding_size: int,
         dreams_embedding_size: int,
         hidden_size: int,
@@ -295,7 +298,14 @@ class SequenceDiT(eqx.Module):
         self.embedding_size = embedding_size
         self.dreams_embedding_size = dreams_embedding_size
 
-        l_key, p_key, t_key = jax.random.split(key, 3)
+    
+        e_key, l_key, p_key, t_key = jax.random.split(key, 4)
+
+        self.embedding = Embedding(
+            vocab_size=vocab_size,
+            embedding_size=embedding_size,
+            key=e_key,
+        )
 
         self.time_conditional_embedder = TimeConditionalEmbedding(
             embedding_size=embedding_size,
