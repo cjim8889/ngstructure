@@ -292,7 +292,7 @@ class MolecularDiffusionTrainer:
                     best_val_loss = val_loss
                     print(f"New best validation loss: {val_loss:.4f}")
                 
-                self.save_checkpoint(checkpoint_dir, self.epoch, val_loss)
+                # self.save_checkpoint(checkpoint_dir, self.epoch, val_loss)
 
 
 def main():
