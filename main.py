@@ -139,9 +139,9 @@ class MolecularDiffusionTrainer:
         # Initialize optimizer
         self.optimizer = optax.adamw(
             learning_rate=learning_rate,
-            weight_decay=1e-4,
+            weight_decay=1e-6,
             b1=0.9,
-            b2=0.95
+            b2=0.99
         )
         
         # Initialize optimizer state
