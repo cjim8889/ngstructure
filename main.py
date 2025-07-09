@@ -10,6 +10,7 @@ import jmp
 import optax
 import wandb
 from tqdm import tqdm
+from deepchem.feat.smiles_tokenizer import SmilesTokenizer
 
 from pkg.data_module import MolecularDataModule
 from pkg.embedding import Embedding
@@ -79,6 +80,8 @@ class MolecularDiffusionTrainer:
         eval_generation: bool = True,
         eval_max_batches: int = 5,
         eval_temperature: float = 1.0,
+        max_steps_per_epoch: Optional[int] = None,
+        tokenizer: Optional[SmilesTokenizer] = None,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         if key is None:
@@ -88,6 +91,7 @@ class MolecularDiffusionTrainer:
         self.embedding_size = embedding_size
         self.max_length = max_length
         self.learning_rate = learning_rate
+        self.max_steps_per_epoch = max_steps_per_epoch
         
         # Evaluation parameters
         self.eval_generation = eval_generation
@@ -130,11 +134,30 @@ class MolecularDiffusionTrainer:
             beta_end=beta_end
         )
         
-        # Initialize generator for evaluation (will need tokenizer from data module)
-        self.generator = None  # Will be initialized in train() when tokenizer is available
+        # Initialize generator and evaluator for evaluation
+        self.generator = None
+        self.evaluator = None
         
-        # Initialize evaluator
-        self.evaluator = MolecularEvaluator() if eval_generation else None
+        if eval_generation:
+            self.evaluator = MolecularEvaluator()
+            
+            if tokenizer is not None:
+                try:
+                    self.generator = MolecularGenerator(
+                        model=self.model,
+                        scheduler=self.scheduler,
+                        tokenizer=tokenizer,
+                        max_length=max_length,
+                        guidance_scale=1.0
+                    )
+                    print("Generator initialized for evaluation.")
+                except Exception as e:
+                    print(f"Warning: Could not initialize generator: {e}")
+                    self.eval_generation = False
+            else:
+                print("Warning: tokenizer not provided, generator will be initialized later in train()")
+        else:
+            print("Evaluation generation disabled.")
         
         # Initialize optimizer
         self.optimizer = optax.adamw(
@@ -157,9 +180,18 @@ class MolecularDiffusionTrainer:
         epoch_loss = 0.0
         num_batches = 0
         
-        pbar = tqdm(data_loader, desc=f"Epoch {epoch}")
+        # Create progress bar with step limit info
+        desc = f"Epoch {epoch}"
+        if self.max_steps_per_epoch is not None:
+            desc += f" (max {self.max_steps_per_epoch} steps)"
+        pbar = tqdm(data_loader, desc=desc)
         
         for batch_idx, batch in enumerate(pbar):
+            # Check if we've reached the maximum steps per epoch
+            if self.max_steps_per_epoch is not None and num_batches >= self.max_steps_per_epoch:
+                print(f"Reached max steps per epoch ({self.max_steps_per_epoch}), stopping early")
+                break
+                
             # Generate random key for this batch
             step_key = jax.random.fold_in(key, self.step)
             
@@ -197,9 +229,18 @@ class MolecularDiffusionTrainer:
         epoch_loss = 0.0
         num_batches = 0
         
-        pbar = tqdm(data_loader, desc=f"Validation {epoch}")
+        # Create progress bar with step limit info
+        desc = f"Validation {epoch}"
+        if self.max_steps_per_epoch is not None:
+            desc += f" (max {self.max_steps_per_epoch} steps)"
+        pbar = tqdm(data_loader, desc=desc)
         
         for batch_idx, batch in enumerate(pbar):
+            # Check if we've reached the maximum steps per epoch
+            if self.max_steps_per_epoch is not None and num_batches >= self.max_steps_per_epoch:
+                print(f"Reached max validation steps per epoch ({self.max_steps_per_epoch}), stopping early")
+                break
+                
             # Generate random key for this batch
             step_key = jax.random.fold_in(key, batch_idx)
             
@@ -369,12 +410,11 @@ class MolecularDiffusionTrainer:
         if key is None:
             key = jax.random.PRNGKey(int(time.time()))
         
-        # Setup data
-        data_module.setup("fit")
+        # Get data loaders (data_module.setup("fit") should already be called)
         train_loader = data_module.get_train_dataloader()
         val_loader = data_module.get_val_dataloader()
         
-        # Initialize generator for evaluation if enabled
+        # Initialize generator for evaluation if not already done and evaluation is enabled
         if self.eval_generation and self.generator is None and self.evaluator is not None:
             try:
                 tokenizer = data_module.tokenizer
@@ -385,9 +425,7 @@ class MolecularDiffusionTrainer:
                     max_length=self.max_length,
                     guidance_scale=1.0
                 )
-
-                self.evaluator = MolecularEvaluator()
-                print("Generator initialized for evaluation.")
+                print("Generator initialized for evaluation (fallback).")
             except Exception as e:
                 print(f"Warning: Could not initialize generator: {e}")
                 self.eval_generation = False
@@ -395,6 +433,15 @@ class MolecularDiffusionTrainer:
         print(f"Starting training for {max_epochs} epochs...")
         print(f"Training samples: {len(data_module.train_dataset)}")
         print(f"Validation samples: {len(data_module.val_dataset)}")
+        
+        # Debug info about evaluation setup
+        if self.eval_generation:
+            if self.generator is not None:
+                print(f"✓ Generation evaluation enabled with {self.eval_max_batches} max batches")
+            else:
+                print("✗ Generation evaluation enabled but generator not initialized")
+        else:
+            print("✗ Generation evaluation disabled")
         
         best_val_loss = float('inf')
         
@@ -427,7 +474,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
     parser.add_argument("--vocab_file", type=str, default="data/vocab.txt", help="Vocabulary file")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=256, help="Maximum sequence length")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of data loader workers")
     
     # Model parameters
@@ -439,6 +486,7 @@ def main():
     # Training parameters
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--max_epochs", type=int, default=100, help="Maximum epochs")
+    parser.add_argument("--max_steps_per_epoch", type=int, default=None, help="Maximum steps per epoch (None means use all data)")
     parser.add_argument("--num_timesteps", type=int, default=1000, help="Number of diffusion timesteps")
     parser.add_argument("--beta_start", type=float, default=1e-4, help="Diffusion beta start")
     parser.add_argument("--beta_end", type=float, default=4e-2, help="Diffusion beta end")
@@ -495,6 +543,9 @@ def main():
     # Get dataset info for model initialization
     dataset_info = data_module.get_dataset_info()
     
+    # Setup data module to initialize tokenizer
+    tokenizer = SmilesTokenizer(vocab_file=args.vocab_file)
+    
     # Calculate hidden size from mlp_ratio
     hidden_size = int(args.embedding_size * args.mlp_ratio)
     
@@ -515,6 +566,8 @@ def main():
         eval_generation=args.eval_generation,
         eval_max_batches=args.eval_max_batches,
         eval_temperature=args.eval_temperature,
+        max_steps_per_epoch=args.max_steps_per_epoch,
+        tokenizer=tokenizer,
         key=key
     )
     
